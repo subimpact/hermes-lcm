@@ -56,8 +56,11 @@ _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from co
 # legitimately repeats durable content (a "retry" turn, a fresh singleton
 # quirk).  The engine's existing contract preserves those, so the multiset
 # replay dedup only takes over once the incoming batch is large enough to be a
-# transcript rebuild rather than a delta.
+# transcript rebuild rather than a delta.  Between the two sizes, a batch that
+# repeats a provider id is a retry sequence, not a plain transcript replay, and
+# keeps the legacy path so the retry is preserved.
 _MULTISET_REPLAY_MIN_MESSAGES = 8
+_MULTISET_REPLAY_SHORT_MIN_MESSAGES = 4
 
 
 class ReconcileMixin:
@@ -843,6 +846,32 @@ class ReconcileMixin:
                     break
         return tuple(sorted(set(ids)))
 
+    def _incoming_has_duplicate_provider_ids(self, messages: List[Dict[str, Any]]) -> bool:
+        """True when the batch repeats a tool id or assistant call id.
+
+        A plain transcript replay has one row per provider id.  Repeated ids
+        mean the batch contains retries and must keep the legacy path, which
+        preserves a retried result that reuses its id with new content.
+        """
+        seen_tool_ids: set[str] = set()
+        seen_call_ids: set[str] = set()
+        for msg in messages:
+            role = str(msg.get("role") or "unknown")
+            tool_call_id = str(msg.get("tool_call_id") or "")
+            if role == "tool" and tool_call_id:
+                if tool_call_id in seen_tool_ids:
+                    return True
+                seen_tool_ids.add(tool_call_id)
+                continue
+            call_ids = self._tool_call_ids_from_identity(
+                self._stable_tool_calls_identity(msg.get("tool_calls"))
+            )
+            if role == "assistant" and call_ids:
+                if any(call_id in seen_call_ids for call_id in call_ids):
+                    return True
+                seen_call_ids.update(call_ids)
+        return False
+
     @staticmethod
     def _multiset_text_identity(
         role: str,
@@ -1086,7 +1115,11 @@ class ReconcileMixin:
             return len(messages)
 
         effective_incoming = len(incoming_identities)
-        if effective_incoming >= _MULTISET_REPLAY_MIN_MESSAGES:
+        replay_sized = effective_incoming >= _MULTISET_REPLAY_MIN_MESSAGES or (
+            effective_incoming >= _MULTISET_REPLAY_SHORT_MIN_MESSAGES
+            and not self._incoming_has_duplicate_provider_ids(messages)
+        )
+        if replay_sized:
             new_indices, stored_rows_scanned, already_stored = self._multiset_persisted_indices(
                 messages
             )
