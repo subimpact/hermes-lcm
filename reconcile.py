@@ -1044,11 +1044,56 @@ class ReconcileMixin:
             raw_session_count=session_count,
         )
         if cursor is not None and cursor > 0:
+            scaffold_only_prefix = not self._effective_replay_identities(messages[:cursor])
             reason = (
                 "skipped scaffold-only prefix"
-                if not self._effective_replay_identities(messages[:cursor])
+                if scaffold_only_prefix
                 else "replayed durable tail"
             )
+            if scaffold_only_prefix:
+                # A scaffold-only prefix (e.g. a "[Recent Summary ...]" block
+                # from a compacted session) proves nothing about the rest of
+                # the batch: after a rebind the remainder is usually the whole
+                # durable fresh tail again.  When the remainder is replay-sized,
+                # filter it with the same multiset difference as the ambiguous
+                # path instead of persisting it wholesale.  The prefix holds no
+                # effective identities, so counting over the full list is the
+                # full-replay case.
+                remainder_effective = len(self._effective_replay_identities(messages[cursor:]))
+                remainder_replay_sized = remainder_effective >= _MULTISET_REPLAY_MIN_MESSAGES or (
+                    remainder_effective >= _MULTISET_REPLAY_SHORT_MIN_MESSAGES
+                    and not self._incoming_has_duplicate_provider_ids(messages[cursor:])
+                )
+                if remainder_replay_sized:
+                    new_indices, _scanned, already_stored = self._multiset_persisted_indices(messages)
+                    new_indices = [idx for idx in new_indices if idx >= cursor]
+                    effective_incoming = len(self._effective_replay_identities(messages))
+                    if not new_indices:
+                        self._record_ingest_reconciliation(
+                            action="advanced cursor",
+                            reason="skipped scaffold-only prefix; persisted multiset delta",
+                            cursor=len(messages),
+                            incoming=len(messages),
+                            session_count=session_count,
+                            stored_tail_count=len(stored_tail),
+                            effective_incoming=effective_incoming,
+                            already_stored=already_stored,
+                            persisted=0,
+                        )
+                        return len(messages)
+                    self._reconcile_multiset_persist_indices = new_indices
+                    self._record_ingest_reconciliation(
+                        action="persisted delta",
+                        reason="skipped scaffold-only prefix; persisted multiset delta",
+                        cursor=0,
+                        incoming=len(messages),
+                        session_count=session_count,
+                        stored_tail_count=len(stored_tail),
+                        effective_incoming=effective_incoming,
+                        already_stored=already_stored,
+                        persisted=len(new_indices),
+                    )
+                    return 0
             self._record_ingest_reconciliation(
                 action="advanced cursor",
                 reason=reason,

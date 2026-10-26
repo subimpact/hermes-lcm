@@ -262,3 +262,52 @@ def test_same_replay_ingested_twice_persists_nothing_the_second_time(tmp_path):
         assert engine._store.get_session_count(SESSION_ID) == seeded
     finally:
         _close(engine)
+
+
+# -- h. compacted session: summary scaffold prefix + durable fresh tail ------
+
+
+def _summary_scaffold() -> dict:
+    return {
+        "role": "user",
+        "content": (
+            "[Recent Summary (d0, node 7)]\n# Session summary: synthetic\n"
+            "[Expand for details: lcm_expand(node_id=7)]"
+        ),
+    }
+
+
+def test_scaffold_prefix_replay_of_durable_tail_persists_nothing(tmp_path):
+    data = _fixture()
+    seeded = _seed(tmp_path, _stored_with_earlier_replay())
+
+    engine = _replay_engine(tmp_path)
+    try:
+        engine._ingest_messages([_summary_scaffold()] + _copy(data["replay"]))
+
+        reconciliation = _reconciliation(engine)
+        assert reconciliation["reason"] == "skipped scaffold-only prefix; persisted multiset delta"
+        assert reconciliation["persisted"] == 0
+        assert engine._store.get_session_count(SESSION_ID) == seeded
+    finally:
+        _close(engine)
+
+
+def test_scaffold_prefix_replay_plus_new_messages_persists_only_new(tmp_path):
+    data = _fixture()
+    seeded = _seed(tmp_path, _stored_with_earlier_replay())
+    new = [
+        {"role": "user", "content": "scaffold new question"},
+        {"role": "assistant", "content": "scaffold new answer"},
+    ]
+
+    engine = _replay_engine(tmp_path)
+    try:
+        engine._ingest_messages([_summary_scaffold()] + _copy(data["replay"]) + _copy(new))
+
+        assert _reconciliation(engine)["persisted"] == 2
+        assert engine._store.get_session_count(SESSION_ID) == seeded + 2
+        assert _contents(engine)[-2:] == ["scaffold new question", "scaffold new answer"]
+        assert not any("Recent Summary" in (c or "") for c in _contents(engine))
+    finally:
+        _close(engine)
